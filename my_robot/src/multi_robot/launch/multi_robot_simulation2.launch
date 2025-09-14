@@ -1,0 +1,118 @@
+<launch>
+  
+  <arg name="world_name" default="$(find multi_robot)/worlds/obstacle_world.world"/>
+  <arg name="gui" default="true"/>
+  <arg name="rviz" default="true"/>
+  <arg name="use_sim_time" default="true"/>
+  
+  <arg name="target_x" default="-2.0"/>
+  <arg name="target_y" default="-2.0"/>
+  <arg name="target_yaw" default="0.0"/>
+  <arg name="c1" default="1.5"/>
+  <arg name="c2" default="1.5"/>
+  <arg name="max_velocity" default="0.1"/>
+  <arg name="scenario_size" default="20.0"/>
+  
+  <arg name="robot1_x" default="8.0"/>
+  <arg name="robot1_y" default="-5.0"/>
+  <arg name="robot1_yaw" default="0"/>
+  
+  <arg name="robot2_x" default="-8.0"/>
+  <arg name="robot2_y" default="8.0"/>
+  <arg name="robot2_yaw" default="0"/>
+  
+  <arg name="robot3_x" default="-8.5"/>
+  <arg name="robot3_y" default="4.0"/>
+  <arg name="robot3_yaw" default="0"/>
+  
+  <arg name="robot4_x" default="3.0"/>
+  <arg name="robot4_y" default="-8.5"/>
+  <arg name="robot4_yaw" default="0"/>
+  
+  <arg name="robot5_x" default="8.0"/>
+  <arg name="robot5_y" default="8.0"/>
+  <arg name="robot5_yaw" default="0"/>
+
+  <node name="robot_visualizer" pkg="multi_robot" type="robot_visualizer.py" output="screen">
+    <param name="target_x" value="$(arg target_x)"/>
+    <param name="target_y" value="$(arg target_y)"/>
+    <param name="target_yaw" value="$(arg target_yaw)"/>
+  </node>  
+
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name" value="$(arg world_name)"/>
+    <arg name="paused" value="false"/>
+    <arg name="use_sim_time" value="$(arg use_sim_time)"/>
+    <arg name="gui" value="$(arg gui)"/>
+    <arg name="headless" value="false"/>
+    <arg name="debug" value="false"/>
+  </include>
+  
+  <node name="map_server" pkg="map_server" type="map_server" 
+        args="$(find multi_robot)/maps/obstacle_world.yaml" output="screen"/>
+  
+  <node name="tf_publisher" pkg="multi_robot" type="tf_publisher.py" output="screen"/>
+  
+  <param name="robot_description" 
+         command="$(find xacro)/xacro $(find multi_robot)/urdf/simple_omni_robot.urdf.xacro robot_name:=robot1"/>
+  
+  <group ns="robot1">
+    <param name="robot_description" 
+           command="$(find xacro)/xacro $(find multi_robot)/urdf/simple_omni_robot.urdf.xacro robot_name:=robot1"/>
+    <node name="spawn_robot1" pkg="gazebo_ros" type="spawn_model" 
+          args="-urdf -param robot_description -model robot1 -x $(arg robot1_x) -y $(arg robot1_y) -z 0.05 -Y $(arg robot1_yaw)"
+          launch-prefix="bash -c 'sleep 3; $0 $@'"/>
+    <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher"/>
+  </group>
+  
+  <group ns="robot2">
+    <param name="robot_description" 
+           command="$(find xacro)/xacro $(find multi_robot)/urdf/simple_omni_robot.urdf.xacro robot_name:=robot2"/>
+    <node name="spawn_robot2" pkg="gazebo_ros" type="spawn_model" 
+          args="-urdf -param robot_description -model robot2 -x $(arg robot2_x) -y $(arg robot2_y) -z 0.05 -Y $(arg robot2_yaw)"
+          launch-prefix="bash -c 'sleep 4; $0 $@'"/>
+    <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher"/>
+  </group>
+  
+  <group ns="robot3">
+    <param name="robot_description" 
+           command="$(find xacro)/xacro $(find multi_robot)/urdf/simple_omni_robot.urdf.xacro robot_name:=robot3"/>
+    <node name="spawn_robot3" pkg="gazebo_ros" type="spawn_model" 
+          args="-urdf -param robot_description -model robot3 -x $(arg robot3_x) -y $(arg robot3_y) -z 0.05 -Y $(arg robot3_yaw)"
+          launch-prefix="bash -c 'sleep 5; $0 $@'"/>
+    <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher"/>
+  </group>
+  
+  <group ns="robot4">
+    <param name="robot_description" 
+           command="$(find xacro)/xacro $(find multi_robot)/urdf/simple_omni_robot.urdf.xacro robot_name:=robot4"/>
+    <node name="spawn_robot4" pkg="gazebo_ros" type="spawn_model" 
+          args="-urdf -param robot_description -model robot4 -x $(arg robot4_x) -y $(arg robot4_y) -z 0.05 -Y $(arg robot4_yaw)"
+          launch-prefix="bash -c 'sleep 6; $0 $@'"/>
+    <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher"/>
+  </group>
+  
+  <group ns="robot5">
+    <param name="robot_description" 
+           command="$(find xacro)/xacro $(find multi_robot)/urdf/simple_omni_robot.urdf.xacro robot_name:=robot5"/>
+    <node name="spawn_robot5" pkg="gazebo_ros" type="spawn_model" 
+          args="-urdf -param robot_description -model robot5 -x $(arg robot5_x) -y $(arg robot5_y) -z 0.05 -Y $(arg robot5_yaw)"
+          launch-prefix="bash -c 'sleep 7; $0 $@'"/>
+    <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher"/>
+  </group>
+  
+  <node name="integrated_rdpso_controller" pkg="multi_robot" type="integrated_rdpso_controller.py" output="screen">
+    <param name="target_x" value="$(arg target_x)"/>
+    <param name="target_y" value="$(arg target_y)"/>
+    <param name="target_yaw" value="$(arg target_yaw)"/>
+    <param name="c1" value="$(arg c1)"/>
+    <param name="c2" value="$(arg c2)"/>
+    <param name="max_velocity" value="$(arg max_velocity)"/>
+    <param name="scenario_size" value="$(arg scenario_size)"/>
+  </node>
+  
+  <group if="$(arg rviz)">
+    <node name="rviz" pkg="rviz" type="rviz" output="screen"/>
+  </group>
+  
+</launch>

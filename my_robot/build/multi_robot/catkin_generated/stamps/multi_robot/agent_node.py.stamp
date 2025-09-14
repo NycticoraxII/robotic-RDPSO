@@ -1,0 +1,361 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import rospy
+import numpy as np
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Float32MultiArray
+import math
+import tf2_ros
+from nav_msgs.msg import Odometry
+
+class RDPSOAgent:
+    def __init__(self):
+        rospy.init_node('rdpso_agent', anonymous=True)
+        
+        # 获取命名空间
+        self.ns = rospy.get_namespace().strip('/')
+        if not self.ns:
+            self.ns = 'robot1'
+        
+        # 获取机器人ID (1-5)
+        self.robot_id = int(self.ns[-1])
+        
+        rospy.loginfo("启动RDPSO Agent节点，命名空间: %s, ID: %d", self.ns, self.robot_id)
+        
+        # 初始化参数
+        self.init_parameters()
+        
+        # 初始化状态变量
+        self.init_state_variables()
+        
+        # 设置通信
+        self.setup_communication()
+        
+        # 控制频率
+        self.rate = rospy.Rate(10)  # 10Hz
+        
+        # 数据接收标志
+        self.received_global_data = False
+        self.received_local_data = False
+
+    def init_parameters(self):
+        """初始化算法参数"""
+        # 从ROS参数获取配置
+        self.target_position = np.array([
+            rospy.get_param('~target_x', 3.4),
+            rospy.get_param('~target_y', -4.0),
+            rospy.get_param('~target_yaw', 0.0)
+        ]).reshape(3, 1)
+        
+        # 算法参数
+        self.c1 = rospy.get_param('~c1', 1.5)
+        self.c2 = rospy.get_param('~c2', 1.5)
+        self.max_velocity = rospy.get_param('~max_velocity', 0.5)
+        self.scenario_size = rospy.get_param('~scenario_size', 20.0)
+        
+        # 避障参数
+        self.obstacle_avoidance_weight = rospy.get_param('~obstacle_weight', 2.0)
+        self.safe_distance = rospy.get_param('~safe_distance', 1.0)
+        
+        rospy.loginfo("目标位置: [%.2f, %.2f, %.2f]", 
+                     self.target_position[0,0], self.target_position[1,0], self.target_position[2,0])
+
+    def init_state_variables(self):
+        """初始化状态变量"""
+        # 机器人真实状态（从传感器获取）
+        self.real_position = np.zeros((3, 1))
+        self.real_velocity = np.zeros((3, 1))
+        self.obstacles = []
+        
+        # PSO粒子状态（算法搜索空间）
+        self.particle_position = np.random.uniform(-self.scenario_size/2, 
+                                                  self.scenario_size/2, (3, 1))
+        self.particle_velocity = np.zeros((3, 1))
+        
+        # PSO算法变量
+        self.personal_best_position = self.particle_position.copy()
+        self.personal_best_fitness = -np.inf
+        
+        # 全局信息（从DataStore接收）
+        self.global_best_position = np.zeros((3, 1))
+        self.global_best_fitness = -np.inf
+        self.mean_best_position = np.zeros((3, 1))
+        self.all_personal_fitness = np.full(5, -np.inf)
+        
+        # 历史适应度（用于计算进化因子）
+        self.fitness_history = [-np.inf, -np.inf]
+
+    def setup_communication(self):
+        """设置通信"""
+        # 订阅器
+        rospy.Subscriber('/global_pso_data', Float32MultiArray, self.global_data_callback)
+        rospy.Subscriber('/{}/odom'.format(self.ns), Odometry, self.odom_callback)
+        rospy.Subscriber('/{}/obstacle_info'.format(self.ns), Float32MultiArray, self.obstacle_callback)
+        
+        # 发布器
+        self.result_pub = rospy.Publisher('/{}/pso_result'.format(self.ns), 
+                                        Float32MultiArray, queue_size=1)
+        self.cmd_vel_pub = rospy.Publisher('/{}/cmd_vel'.format(self.ns), 
+                                          Twist, queue_size=1)
+
+    def odom_callback(self, msg):
+        """里程计回调 - 获取机器人真实位置"""
+        self.real_position[0, 0] = msg.pose.pose.position.x
+        self.real_position[1, 0] = msg.pose.pose.position.y
+        
+        # 四元数转yaw
+        q = msg.pose.pose.orientation
+        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+        self.real_position[2, 0] = math.atan2(siny_cosp, cosy_cosp)
+        
+        # 速度信息
+        self.real_velocity[0, 0] = msg.twist.twist.linear.x
+        self.real_velocity[1, 0] = msg.twist.twist.linear.y
+        self.real_velocity[2, 0] = msg.twist.twist.angular.z
+        
+        self.received_local_data = True
+
+    def obstacle_callback(self, msg):
+        """障碍物信息回调"""
+        try:
+            data = msg.data
+            if len(data) % 3 != 0:
+                rospy.logwarn("障碍物数据长度错误: %d", len(data))
+                return
+            
+            num_obstacles = len(data) // 3
+            self.obstacles = []
+            
+            for i in range(num_obstacles):
+                obs = {
+                    'x': data[i*3],
+                    'y': data[i*3 + 1],
+                    'radius': data[i*3 + 2]
+                }
+                self.obstacles.append(obs)
+                
+        except Exception as e:
+            rospy.logerr("处理障碍物数据错误: %s", str(e))
+
+    def global_data_callback(self, msg):
+        """全局PSO数据回调
+        数据格式: [all_F_p(5), gBest(3), F_gBest(1), mBest(3)] (共12个float)
+        """
+        try:
+            data = msg.data
+            if len(data) != 12:
+                rospy.logwarn("全局数据长度错误! 期望12，收到%d", len(data))
+                return
+            
+            # 解析数据
+            self.all_personal_fitness = np.array(data[:5])
+            self.global_best_position = np.array(data[5:8]).reshape(3, 1)
+            self.global_best_fitness = data[8]
+            self.mean_best_position = np.array(data[9:12]).reshape(3, 1)
+            
+            self.received_global_data = True
+            
+        except Exception as e:
+            rospy.logerr("解析全局数据错误: %s", str(e))
+
+    def calculate_fitness(self, position):
+        """计算适应度函数"""
+        # 基础适应度：到目标的距离（越近越好）
+        target_distance = np.linalg.norm(position[:2] - self.target_position[:2])
+        max_distance = math.sqrt(2 * self.scenario_size**2)
+        distance_fitness = max(0, 1 - target_distance / max_distance)
+        
+        # 障碍物惩罚
+        obstacle_penalty = 0
+        for obs in self.obstacles:
+            obs_pos = np.array([obs['x'], obs['y']])
+            dist_to_obs = np.linalg.norm(position[:2].flatten() - obs_pos)
+            if dist_to_obs < obs['radius'] + self.safe_distance:
+                # 距离障碍物越近，惩罚越大
+                penalty = max(0, 1 - dist_to_obs / (obs['radius'] + self.safe_distance))
+                obstacle_penalty += penalty
+        
+        # 边界惩罚
+        boundary_penalty = 0
+        for i in range(2):  # x, y坐标
+            if abs(position[i, 0]) > self.scenario_size / 2:
+                boundary_penalty += 1
+        
+        # 综合适应度
+        fitness = distance_fitness - 0.5 * obstacle_penalty - 0.3 * boundary_penalty
+        
+        return max(0, fitness)
+
+    def calculate_evolution_factor(self):
+        """计算进化因子h"""
+        if self.fitness_history[1] == -np.inf or self.fitness_history[0] == -np.inf:
+            return 1.0
+        
+        current = self.fitness_history[1]
+        previous = self.fitness_history[0]
+        
+        if max(current, previous) == 0:
+            return 1.0
+        
+        h = 1 - min(current, previous) / max(current, previous)
+        return h
+
+    def calculate_aggregation_factor(self):
+        """计算聚集度s"""
+        if self.global_best_fitness <= 0:
+            return 1.0
+        
+        # 使用所有机器人的平均适应度
+        mean_fitness = np.mean(self.all_personal_fitness[self.all_personal_fitness > -np.inf])
+        if mean_fitness <= 0:
+            return 1.0
+        
+        s = min(self.global_best_fitness, mean_fitness) / max(self.global_best_fitness, mean_fitness)
+        return s
+
+    def update_particle(self):
+        """更新PSO粒子位置和速度"""
+        if not (self.received_global_data and self.received_local_data):
+            return
+        
+        # 计算当前适应度
+        current_fitness = self.calculate_fitness(self.particle_position)
+        
+        # 更新适应度历史
+        self.fitness_history[0] = self.fitness_history[1]
+        self.fitness_history[1] = current_fitness
+        
+        # 更新个人最佳
+        if current_fitness > self.personal_best_fitness:
+            self.personal_best_position = self.particle_position.copy()
+            self.personal_best_fitness = current_fitness
+        
+        # 计算RDPSO参数
+        h = self.calculate_evolution_factor()
+        s = self.calculate_aggregation_factor()
+        
+        # 动态惯性权重
+        w = 0.9 - 0.4 * (1 - 0.5 * h + 0.9 * s)
+        w = max(0.1, min(0.9, w))  # 限制范围
+        
+        # PSO速度更新公式
+        r1, r2, r3 = np.random.rand(3)
+        
+        # 标准PSO项
+        inertia_term = w * self.particle_velocity
+        cognitive_term = self.c1 * r1 * (self.personal_best_position - self.particle_position)
+        social_term = self.c2 * r2 * (self.global_best_position - self.particle_position)
+        
+        # RDPSO特有的平均项
+        mean_term = 0.1 * r3 * (self.mean_best_position - self.particle_position)
+        
+        # 更新速度
+        new_velocity = inertia_term + cognitive_term + social_term + mean_term
+        
+        # 速度限制
+        max_vel = self.max_velocity
+        new_velocity = np.clip(new_velocity, -max_vel, max_vel)
+        
+        # 更新位置
+        new_position = self.particle_position + new_velocity
+        
+        # 边界处理
+        boundary = self.scenario_size / 2
+        new_position[:2] = np.clip(new_position[:2], -boundary, boundary)
+        new_position[2] = np.clip(new_position[2], -math.pi, math.pi)
+        
+        # 应用更新
+        self.particle_velocity = new_velocity
+        self.particle_position = new_position
+        
+        rospy.logdebug("粒子更新: 位置=%s, 适应度=%.3f, w=%.3f, h=%.3f, s=%.3f",
+                      str(self.particle_position.flatten()), current_fitness, w, h, s)
+
+    def calculate_control_command(self):
+        """计算控制指令"""
+        if not self.received_local_data:
+            return Twist()
+        
+        # 计算期望位置（粒子位置）与当前位置的差异
+        position_error = self.particle_position - self.real_position
+        
+        # 简单的比例控制
+        kp_linear = 1.0
+        kp_angular = 2.0
+        
+        cmd = Twist()
+        
+        # 线速度控制（全向轮）
+        cmd.linear.x = kp_linear * position_error[0, 0]
+        cmd.linear.y = kp_linear * position_error[1, 0]
+        
+        # 角速度控制
+        cmd.angular.z = kp_angular * position_error[2, 0]
+        
+        # 速度限制
+        max_linear = 0.5
+        max_angular = 1.0
+        
+        cmd.linear.x = max(-max_linear, min(max_linear, cmd.linear.x))
+        cmd.linear.y = max(-max_linear, min(max_linear, cmd.linear.y))
+        cmd.angular.z = max(-max_angular, min(max_angular, cmd.angular.z))
+        
+        return cmd
+
+    def publish_result(self):
+        """发布结果到DataStore
+        数据格式: [robot_id(1), pBest(3), F_p(1), particle_pos(3)] (共8个float)
+        """
+        try:
+            msg = Float32MultiArray()
+            msg.data = [
+                float(self.robot_id),
+                self.personal_best_position[0, 0],
+                self.personal_best_position[1, 0],
+                self.personal_best_position[2, 0],
+                self.personal_best_fitness,
+                self.particle_position[0, 0],
+                self.particle_position[1, 0],
+                self.particle_position[2, 0]
+            ]
+            
+            self.result_pub.publish(msg)
+            
+        except Exception as e:
+            rospy.logerr("发布结果错误: %s", str(e))
+
+    def run(self):
+        """主运行循环"""
+        rospy.loginfo("RDPSO Agent开始运行...")
+        
+        while not rospy.is_shutdown():
+            try:
+                # 更新PSO粒子
+                self.update_particle()
+                
+                # 发布算法结果
+                self.publish_result()
+                
+                # 计算并发布控制指令
+                cmd = self.calculate_control_command()
+                self.cmd_vel_pub.publish(cmd)
+                
+                self.rate.sleep()
+                
+            except rospy.ROSInterruptException:
+                rospy.loginfo("接收到终止信号，关闭节点...")
+                break
+            except Exception as e:
+                rospy.logerr("主循环错误: %s", str(e))
+                self.rate.sleep()
+
+if __name__ == '__main__':
+    try:
+        agent = RDPSOAgent()
+        agent.run()
+    except rospy.ROSInterruptException:
+        pass
+    except Exception as e:
+        rospy.logerr("节点初始化失败: %s", str(e))

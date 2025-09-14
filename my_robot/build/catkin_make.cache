@@ -1,0 +1,2 @@
+multi_robot
+-DCATKIN_DEVEL_PREFIX=/home/wheeltec-client/my_robot/devel -DCMAKE_INSTALL_PREFIX=/home/wheeltec-client/my_robot/install -G Unix Makefiles

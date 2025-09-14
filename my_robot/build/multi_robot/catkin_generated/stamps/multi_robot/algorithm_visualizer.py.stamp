@@ -1,0 +1,238 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import rospy
+import math
+from nav_msgs.msg import Path
+from geometry_msgs.msg import PoseStamped
+from visualization_msgs.msg import Marker
+
+class PathTestNode:
+    def __init__(self):
+        rospy.init_node('path_test_node', anonymous=True)
+        rospy.loginfo("=== Path Test Node Started ===")
+        
+        # Publishers
+        self.path_pubs = []
+        self.marker_pub = rospy.Publisher('/test_markers', Marker, queue_size=10)
+        
+        # Create path publishers for 5 robots
+        for i in range(5):
+            topic_name = '/robot{}/path'.format(i+1)
+            path_pub = rospy.Publisher(topic_name, Path, queue_size=10, latch=True)
+            self.path_pubs.append(path_pub)
+            rospy.loginfo("Created publisher: %s", topic_name)
+        
+        # Global test path
+        self.global_path_pub = rospy.Publisher('/test_path', Path, queue_size=10, latch=True)
+        
+        rospy.loginfo("Publishers initialized")
+        
+        # Wait for connections
+        rospy.sleep(2.0)
+        
+        # Publish test paths
+        self.publish_test_paths()
+        
+        rospy.loginfo("=== Path Test Node Ready ===")
+
+    def create_circle_path(self, center_x, center_y, radius, num_points):
+        """Create circular path"""
+        path = Path()
+        path.header.frame_id = "map"
+        path.header.stamp = rospy.Time.now()
+        
+        for i in range(num_points + 1):
+            angle = 2.0 * math.pi * i / num_points
+            
+            pose = PoseStamped()
+            pose.header.frame_id = "map"
+            pose.header.stamp = rospy.Time.now()
+            
+            pose.pose.position.x = center_x + radius * math.cos(angle)
+            pose.pose.position.y = center_y + radius * math.sin(angle)
+            pose.pose.position.z = 0.0
+            
+            yaw = angle + math.pi / 2.0
+            pose.pose.orientation.x = 0.0
+            pose.pose.orientation.y = 0.0
+            pose.pose.orientation.z = math.sin(yaw / 2.0)
+            pose.pose.orientation.w = math.cos(yaw / 2.0)
+            
+            path.poses.append(pose)
+        
+        return path
+
+    def create_line_path(self, start_x, start_y, end_x, end_y, num_points):
+        """Create straight line path"""
+        path = Path()
+        path.header.frame_id = "map"
+        path.header.stamp = rospy.Time.now()
+        
+        for i in range(num_points):
+            t = float(i) / (num_points - 1)
+            
+            pose = PoseStamped()
+            pose.header.frame_id = "map"
+            pose.header.stamp = rospy.Time.now()
+            
+            pose.pose.position.x = start_x + t * (end_x - start_x)
+            pose.pose.position.y = start_y + t * (end_y - start_y)
+            pose.pose.position.z = 0.0
+            
+            yaw = math.atan2(end_y - start_y, end_x - start_x)
+            pose.pose.orientation.x = 0.0
+            pose.pose.orientation.y = 0.0
+            pose.pose.orientation.z = math.sin(yaw / 2.0)
+            pose.pose.orientation.w = math.cos(yaw / 2.0)
+            
+            path.poses.append(pose)
+        
+        return path
+
+    def create_square_path(self, center_x, center_y, size, points_per_side):
+        """Create square path"""
+        path = Path()
+        path.header.frame_id = "map"
+        path.header.stamp = rospy.Time.now()
+        
+        half_size = size / 2.0
+        corners = [
+            (center_x - half_size, center_y - half_size),
+            (center_x + half_size, center_y - half_size),
+            (center_x + half_size, center_y + half_size),
+            (center_x - half_size, center_y + half_size),
+        ]
+        
+        for i in range(4):
+            start = corners[i]
+            end = corners[(i + 1) % 4]
+            
+            for j in range(points_per_side):
+                t = float(j) / points_per_side
+                
+                pose = PoseStamped()
+                pose.header.frame_id = "map"
+                pose.header.stamp = rospy.Time.now()
+                
+                pose.pose.position.x = start[0] + t * (end[0] - start[0])
+                pose.pose.position.y = start[1] + t * (end[1] - start[1])
+                pose.pose.position.z = 0.0
+                
+                yaw = math.atan2(end[1] - start[1], end[0] - start[0])
+                pose.pose.orientation.x = 0.0
+                pose.pose.orientation.y = 0.0
+                pose.pose.orientation.z = math.sin(yaw / 2.0)
+                pose.pose.orientation.w = math.cos(yaw / 2.0)
+                
+                path.poses.append(pose)
+        
+        return path
+
+    def publish_test_paths(self):
+        """Publish all test paths"""
+        try:
+            rospy.loginfo("Publishing test paths...")
+            
+            # Robot1: Small circle
+            path1 = self.create_circle_path(0, 0, 2.0, 50)
+            self.path_pubs[0].publish(path1)
+            rospy.loginfo("Robot1 path: Circle with %d points", len(path1.poses))
+            
+            # Robot2: Square
+            path2 = self.create_square_path(0, 0, 3.0, 20)
+            self.path_pubs[1].publish(path2)
+            rospy.loginfo("Robot2 path: Square with %d points", len(path2.poses))
+            
+            # Robot3: Diagonal line
+            path3 = self.create_line_path(-3, -3, 3, 3, 30)
+            self.path_pubs[2].publish(path3)
+            rospy.loginfo("Robot3 path: Line with %d points", len(path3.poses))
+            
+            # Robot4: Another diagonal
+            path4 = self.create_line_path(-3, 3, 3, -3, 30)
+            self.path_pubs[3].publish(path4)
+            rospy.loginfo("Robot4 path: Line with %d points", len(path4.poses))
+            
+            # Robot5: Large circle
+            path5 = self.create_circle_path(0, 0, 4.0, 80)
+            self.path_pubs[4].publish(path5)
+            rospy.loginfo("Robot5 path: Large circle with %d points", len(path5.poses))
+            
+            # Global test path
+            global_path = self.create_circle_path(0, 0, 5.0, 100)
+            self.global_path_pub.publish(global_path)
+            rospy.loginfo("Global path: Super large circle with %d points", len(global_path.poses))
+            
+            # Publish center marker
+            self.publish_center_marker()
+            
+            rospy.loginfo("All paths published successfully!")
+            
+        except Exception as e:
+            rospy.logerr("Error publishing paths: %s", str(e))
+
+    def publish_center_marker(self):
+        """Publish center marker"""
+        try:
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = rospy.Time.now()
+            marker.ns = "center"
+            marker.id = 0
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+            
+            marker.pose.position.x = 0.0
+            marker.pose.position.y = 0.0
+            marker.pose.position.z = 1.0
+            marker.pose.orientation.w = 1.0
+            
+            marker.scale.x = 0.5
+            marker.scale.y = 0.5
+            marker.scale.z = 0.5
+            
+            marker.color.r = 1.0
+            marker.color.g = 0.0
+            marker.color.b = 0.0
+            marker.color.a = 1.0
+            
+            marker.lifetime = rospy.Duration(0)
+            
+            self.marker_pub.publish(marker)
+            rospy.loginfo("Center marker published")
+            
+        except Exception as e:
+            rospy.logerr("Error publishing marker: %s", str(e))
+
+    def run(self):
+        """Main run loop"""
+        rospy.loginfo("=== Visualization Test Started ===")
+        rospy.loginfo("Published topics:")
+        rospy.loginfo("  /robot1/path - Small circle")
+        rospy.loginfo("  /robot2/path - Square")
+        rospy.loginfo("  /robot3/path - Diagonal line 1")
+        rospy.loginfo("  /robot4/path - Diagonal line 2")
+        rospy.loginfo("  /robot5/path - Large circle")
+        rospy.loginfo("  /test_path - Super large circle")
+        rospy.loginfo("  /test_markers - Center marker")
+        rospy.loginfo("")
+        rospy.loginfo("In RViz:")
+        rospy.loginfo("1. Set Fixed Frame to: map")
+        rospy.loginfo("2. Add Path displays")
+        rospy.loginfo("3. Add Marker display")
+        
+        # Republish every 10 seconds
+        rate = rospy.Rate(0.1)
+        while not rospy.is_shutdown():
+            self.publish_test_paths()
+            rate.sleep()
+
+if __name__ == '__main__':
+    try:
+        node = PathTestNode()
+        node.run()
+    except rospy.ROSInterruptException:
+        rospy.loginfo("Program interrupted by user")
+    except Exception as e:
+        rospy.logerr("Program failed: %s", str(e))

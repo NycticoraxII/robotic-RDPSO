@@ -1,0 +1,271 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import rospy
+import numpy as np
+import math
+import tf2_ros
+from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
+from std_msgs.msg import Float32MultiArray, ColorRGBA
+from geometry_msgs.msg import TransformStamped, Point
+from visualization_msgs.msg import Marker, MarkerArray
+
+class ObstacleDetector:
+    def __init__(self):
+        rospy.init_node('obstacle_detector', anonymous=True)
+        
+        # 获取命名空间
+        self.ns = rospy.get_namespace().strip('/')
+        if not self.ns:
+            self.ns = 'robot1'
+        
+        rospy.loginfo("启动障碍物检测节点，命名空间: %s", self.ns)
+        
+        # 初始化变量
+        self.position = np.zeros(3)
+        self.velocity = np.zeros(3)
+        self.obstacles = []
+        
+        # TF监听器
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+        
+        # 订阅器
+        rospy.Subscriber('/{}/scan'.format(self.ns), LaserScan, self.laser_callback)
+        rospy.Subscriber('/{}/odom'.format(self.ns), Odometry, self.odom_callback)
+        
+        # 发布器
+        self.data_pub = rospy.Publisher('/{}/robot_detected_data'.format(self.ns), 
+                                       Float32MultiArray, queue_size=1)
+        
+        # 可视化发布器
+        self.marker_pub = rospy.Publisher('/{}/obstacle_markers'.format(self.ns), 
+                                         MarkerArray, queue_size=1)
+        
+        self.rate = rospy.Rate(10)  # 10Hz
+
+    def odom_callback(self, msg):
+        """里程计回调"""
+        self.position[0] = msg.pose.pose.position.x
+        self.position[1] = msg.pose.pose.position.y
+        
+        # 四元数转yaw
+        q = msg.pose.pose.orientation
+        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+        self.position[2] = math.atan2(siny_cosp, cosy_cosp)
+        
+        # 速度
+        self.velocity[0] = msg.twist.twist.linear.x
+        self.velocity[1] = msg.twist.twist.linear.y
+        self.velocity[2] = msg.twist.twist.angular.z
+
+    def laser_callback(self, msg):
+        """激光雷达回调"""
+        self.obstacles = []
+        
+        # 简单的障碍物检测算法
+        ranges = np.array(msg.ranges)
+        angles = np.linspace(msg.angle_min, msg.angle_max, len(ranges))
+        
+        # 过滤无效数据
+        valid_indices = np.where((ranges > msg.range_min) & (ranges < msg.range_max))[0]
+        
+        for i in valid_indices:
+            if ranges[i] < 2.0:  # 2米内的障碍物
+                # 转换到全局坐标系
+                local_x = ranges[i] * math.cos(angles[i])
+                local_y = ranges[i] * math.sin(angles[i])
+                
+                # 转换到全局坐标
+                cos_theta = math.cos(self.position[2])
+                sin_theta = math.sin(self.position[2])
+                
+                global_x = self.position[0] + local_x * cos_theta - local_y * sin_theta
+                global_y = self.position[1] + local_x * sin_theta + local_y * cos_theta
+                
+                # 假设障碍物半径为0.1m
+                self.obstacles.append([global_x, global_y, 0.1])
+        
+        # 聚类相近的障碍物点
+        self.obstacles = self.cluster_obstacles(self.obstacles)
+        
+        # 发布检测数据
+        self.publish_detected_data()
+        
+        # 发布可视化数据
+        self.publish_obstacle_markers()
+
+    def cluster_obstacles(self, obstacles, cluster_distance=0.3):
+        """聚类障碍物点"""
+        if not obstacles:
+            return []
+        
+        clustered = []
+        obstacles = np.array(obstacles)
+        used = np.zeros(len(obstacles), dtype=bool)
+        
+        for i in range(len(obstacles)):
+            if used[i]:
+                continue
+                
+            cluster = [obstacles[i]]
+            used[i] = True
+            
+            for j in range(i+1, len(obstacles)):
+                if used[j]:
+                    continue
+                    
+                dist = np.linalg.norm(obstacles[i][:2] - obstacles[j][:2])
+                if dist < cluster_distance:
+                    cluster.append(obstacles[j])
+                    used[j] = True
+            
+            # 计算聚类中心
+            cluster = np.array(cluster)
+            center_x = np.mean(cluster[:, 0])
+            center_y = np.mean(cluster[:, 1])
+            max_radius = np.max(cluster[:, 2])
+            
+            clustered.append([center_x, center_y, max_radius])
+        
+        return clustered
+
+    def publish_obstacle_markers(self):
+        """发布障碍物可视化标记"""
+        try:
+            marker_array = MarkerArray()
+            
+            # 首先发布一个删除所有标记的消息
+            delete_marker = Marker()
+            delete_marker.header.frame_id = "map"  # 或者使用 "odom"
+            delete_marker.header.stamp = rospy.Time.now()
+            delete_marker.ns = "{}_obstacles".format(self.ns)
+            delete_marker.action = Marker.DELETEALL
+            marker_array.markers.append(delete_marker)
+            
+            # 为每个障碍物创建标记
+            for i, obstacle in enumerate(self.obstacles):
+                marker = Marker()
+                marker.header.frame_id = "map"  # 或者使用 "odom"
+                marker.header.stamp = rospy.Time.now()
+                marker.ns = "{}_obstacles".format(self.ns)
+                marker.id = i
+                marker.type = Marker.CYLINDER  # 使用圆柱体表示障碍物
+                marker.action = Marker.ADD
+                
+                # 设置位置
+                marker.pose.position.x = obstacle[0]
+                marker.pose.position.y = obstacle[1]
+                marker.pose.position.z = 0.0
+                
+                # 设置方向（默认）
+                marker.pose.orientation.x = 0.0
+                marker.pose.orientation.y = 0.0
+                marker.pose.orientation.z = 0.0
+                marker.pose.orientation.w = 1.0
+                
+                # 设置大小
+                marker.scale.x = obstacle[2] * 2  # 直径
+                marker.scale.y = obstacle[2] * 2  # 直径
+                marker.scale.z = 0.5  # 高度
+                
+                # 设置颜色（红色半透明）
+                marker.color.r = 1.0
+                marker.color.g = 0.0
+                marker.color.b = 0.0
+                marker.color.a = 0.7
+                
+                # 设置生存时间
+                marker.lifetime = rospy.Duration(0.5)  # 0.5秒后自动删除
+                
+                marker_array.markers.append(marker)
+            
+            # 添加障碍物标签
+            for i, obstacle in enumerate(self.obstacles):
+                text_marker = Marker()
+                text_marker.header.frame_id = "map"
+                text_marker.header.stamp = rospy.Time.now()
+                text_marker.ns = "{}_obstacle_labels".format(self.ns)
+                text_marker.id = i
+                text_marker.type = Marker.TEXT_VIEW_FACING
+                text_marker.action = Marker.ADD
+                
+                # 设置位置（略高于障碍物）
+                text_marker.pose.position.x = obstacle[0]
+                text_marker.pose.position.y = obstacle[1]
+                text_marker.pose.position.z = 0.8
+                
+                # 设置方向
+                text_marker.pose.orientation.w = 1.0
+                
+                # 设置文本
+                text_marker.text = "Obs{}".format(i+1)
+                
+                # 设置大小
+                text_marker.scale.z = 0.2  # 文字大小
+                
+                # 设置颜色（白色）
+                text_marker.color.r = 1.0
+                text_marker.color.g = 1.0
+                text_marker.color.b = 1.0
+                text_marker.color.a = 1.0
+                
+                # 设置生存时间
+                text_marker.lifetime = rospy.Duration(0.5)
+                
+                marker_array.markers.append(text_marker)
+            
+            # 发布标记数组
+            self.marker_pub.publish(marker_array)
+            
+            rospy.logdebug("发布了 %d 个障碍物标记", len(self.obstacles))
+            
+        except Exception as e:
+            rospy.logerr("发布障碍物标记错误: %s", str(e))
+
+    def publish_detected_data(self):
+        """发布检测数据"""
+        try:
+            msg = Float32MultiArray()
+            msg.data = []
+            
+            # 添加位置数据 (3个float)
+            msg.data.extend(self.position.tolist())
+            
+            # 添加速度数据 (3个float)
+            msg.data.extend(self.velocity.tolist())
+            
+            # 添加障碍物数量 (1个int)
+            msg.data.append(len(self.obstacles))
+            
+            # 添加障碍物数据 (每个障碍物3个float: x, y, radius)
+            for obs in self.obstacles:
+                msg.data.extend(obs)
+            
+            self.data_pub.publish(msg)
+            
+            rospy.loginfo("发布检测数据: 位置=%s, 障碍物数量=%d", 
+                         str(self.position.tolist()), len(self.obstacles))
+            
+        except Exception as e:
+            rospy.logerr("发布检测数据错误: %s", str(e))
+
+    def run(self):
+        """主运行循环"""
+        while not rospy.is_shutdown():
+            try:
+                self.rate.sleep()
+            except rospy.ROSInterruptException:
+                rospy.loginfo("接收到终止信号，关闭节点...")
+                break
+
+if __name__ == '__main__':
+    try:
+        node = ObstacleDetector()
+        node.run()
+    except rospy.ROSInterruptException:
+        pass
+    except Exception as e:
+        rospy.logerr("节点初始化失败: %s", str(e))

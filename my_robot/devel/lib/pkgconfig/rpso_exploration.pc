@@ -1,0 +1,8 @@
+prefix=/home/wheeltec-client/my_robot/devel
+
+Name: rpso_exploration
+Description: Description of rpso_exploration
+Version: 0.0.1
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: 

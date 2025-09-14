@@ -1,0 +1,419 @@
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+
+import rospy
+import numpy as np
+from nav_msgs.msg import OccupancyGrid, Odometry
+from geometry_msgs.msg import Twist, PointStamped
+from sensor_msgs.msg import LaserScan
+import random
+import math
+from visualization_msgs.msg import Marker
+from std_msgs.msg import ColorRGBA
+
+class Particle:
+    def __init__(self, x, y):
+        self.position = np.array([x, y], dtype=float)
+        self.velocity = np.array([random.uniform(-0.5, 0.5), random.uniform(-0.5, 0.5)], dtype=float)
+        self.best_position = self.position.copy()
+        self.best_fitness = -float('inf')
+
+class RPSOExploration:
+    def __init__(self):
+        rospy.init_node('rpso_exploration', anonymous=False)
+        
+        # PSO参数
+        self.num_particles = 20
+        self.w = 0.729  # 惯性权重
+        self.c1 = 1.49445  # 个体学习因子
+        self.c2 = 1.49445  # 群体学习因子
+        
+        # 机器人控制参数
+        self.max_linear_speed = 0.3
+        self.max_angular_speed = 0.5
+        self.goal_tolerance = 0.3  # 到达目标点的容忍距离
+        
+        # 探索参数
+        self.info_radius = rospy.get_param('~info_radius', 1.0)
+        self.hysteresis_radius = rospy.get_param('~hysteresis_radius', 3.0)
+        self.hysteresis_gain = rospy.get_param('~hysteresis_gain', 2.0)
+        
+        # 状态变量
+        self.map_data = None
+        self.robot_position = np.array([0.0, 0.0])
+        self.robot_orientation = 0.0
+        self.laser_data = None
+        self.frontiers = []
+        self.particles = []
+        self.global_best_position = None
+        self.global_best_fitness = -float('inf')
+        self.current_target = None
+        self.last_target_time = rospy.Time.now()
+        self.target_timeout = rospy.Duration(10.0)  # 目标超时时间
+        
+        # ROS订阅者
+        rospy.Subscriber('/map', OccupancyGrid, self.map_callback)
+        rospy.Subscriber('/odom', Odometry, self.odom_callback)
+        rospy.Subscriber('/scan', LaserScan, self.scan_callback)
+        
+        # ROS发布者
+        self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
+        self.target_pub = rospy.Publisher('/rpso_target', PointStamped, queue_size=1)
+        self.particles_pub = rospy.Publisher('/rpso_particles', Marker, queue_size=1)
+        self.frontiers_pub = rospy.Publisher('/rpso_frontiers', Marker, queue_size=1)
+        
+        # 等待关键数据
+        rospy.loginfo("等待地图数据...")
+        while self.map_data is None and not rospy.is_shutdown():
+            rospy.sleep(0.1)
+        rospy.loginfo("地图数据已接收")
+        
+        # 初始化粒子群
+        self.initialize_particles()
+        
+        rospy.loginfo("RPSO探索节点初始化完成")
+        
+    def map_callback(self, data):
+        self.map_data = data
+        # 检测前沿点
+        self.detect_frontiers()
+        
+    def odom_callback(self, data):
+        # 获取机器人位置
+        self.robot_position = np.array([
+            data.pose.pose.position.x,
+            data.pose.pose.position.y
+        ])
+        
+        # 获取机器人朝向（四元数转欧拉角）
+        orientation = data.pose.pose.orientation
+        self.robot_orientation = self.quaternion_to_yaw(orientation)
+        
+    def scan_callback(self, data):
+        self.laser_data = data
+        
+    def quaternion_to_yaw(self, orientation):
+        """将四元数转换为偏航角"""
+        siny_cosp = 2 * (orientation.w * orientation.z + orientation.x * orientation.y)
+        cosy_cosp = 1 - 2 * (orientation.y * orientation.y + orientation.z * orientation.z)
+        return math.atan2(siny_cosp, cosy_cosp)
+        
+    def initialize_particles(self):
+        """初始化粒子群"""
+        if self.map_data is None:
+            return
+            
+        self.particles = []
+        width = self.map_data.info.width
+        height = self.map_data.info.height
+        resolution = self.map_data.info.resolution
+        origin_x = self.map_data.info.origin.position.x
+        origin_y = self.map_data.info.origin.position.y
+        
+        # 在地图范围内随机初始化粒子
+        for _ in range(self.num_particles):
+            x = random.uniform(origin_x, origin_x + width * resolution)
+            y = random.uniform(origin_y, origin_y + height * resolution)
+            self.particles.append(Particle(x, y))
+            
+        self.global_best_position = self.particles[0].position.copy()
+        self.global_best_fitness = -float('inf')
+        
+    def detect_frontiers(self):
+        """检测前沿点"""
+        if self.map_data is None:
+            return
+            
+        self.frontiers = []
+        data = self.map_data.data
+        width = self.map_data.info.width
+        height = self.map_data.info.height
+        resolution = self.map_data.info.resolution
+        origin_x = self.map_data.info.origin.position.x
+        origin_y = self.map_data.info.origin.position.y
+        
+        # 检测前沿点：未知区域(-1)与已知自由空间(0)的边界
+        for y in range(1, height-1):
+            for x in range(1, width-1):
+                index = y * width + x
+                # 如果是未知区域
+                if data[index] == -1:
+                    # 检查周围8个邻居是否有已知自由空间
+                    neighbors = [
+                        data[index - width - 1], data[index - width], data[index - width + 1],
+                        data[index - 1], data[index + 1],
+                        data[index + width - 1], data[index + width], data[index + width + 1]
+                    ]
+                    # 如果周围有自由空间，则为前沿点
+                    if 0 in neighbors:
+                        world_x = origin_x + x * resolution
+                        world_y = origin_y + y * resolution
+                        self.frontiers.append([world_x, world_y])
+                        
+    def calculate_information_gain(self, position):
+        """计算信息增益"""
+        if not self.frontiers:
+            return 0
+            
+        info_gain = 0
+        for frontier in self.frontiers:
+            distance = np.linalg.norm(np.array(frontier) - position)
+            if distance < self.info_radius and distance > 0:
+                info_gain += 1.0 / distance  # 距离越近，信息增益越大
+                
+        return info_gain
+        
+    def is_obstacle_ahead(self, target_position):
+        """检查到目标点路径上是否有障碍物"""
+        if self.laser_data is None:
+            return False
+            
+        # 计算到目标点的角度
+        delta = target_position - self.robot_position
+        target_angle = math.atan2(delta[1], delta[0])
+        angle_diff = self.normalize_angle(target_angle - self.robot_orientation)
+        
+        # 检查激光雷达数据中该方向是否有障碍物
+        angle_min = self.laser_data.angle_min
+        angle_increment = self.laser_data.angle_increment
+        
+        # 找到最近的激光束
+        beam_index = int((angle_diff - angle_min) / angle_increment)
+        if 0 <= beam_index < len(self.laser_data.ranges):
+            distance = self.laser_data.ranges[beam_index]
+            # 如果距离小于到目标点的距离，则有障碍物
+            target_distance = np.linalg.norm(delta)
+            if distance < target_distance - 0.2:  # 留一些余量
+                return True
+                
+        return False
+        
+    def normalize_angle(self, angle):
+        """将角度标准化到[-pi, pi]范围"""
+        while angle > math.pi:
+            angle -= 2 * math.pi
+        while angle < -math.pi:
+            angle += 2 * math.pi
+        return angle
+        
+    def calculate_fitness(self, position):
+        """计算粒子适应度"""
+        if self.map_data is None:
+            return -float('inf')
+            
+        # 检查位置是否在地图范围内
+        width = self.map_data.info.width
+        height = self.map_data.info.height
+        resolution = self.map_data.info.resolution
+        origin_x = self.map_data.info.origin.position.x
+        origin_y = self.map_data.info.origin.position.y
+        
+        map_x = int((position[0] - origin_x) / resolution)
+        map_y = int((position[1] - origin_y) / resolution)
+        
+        if map_x < 0 or map_x >= width or map_y < 0 or map_y >= height:
+            return -float('inf')
+            
+        # 检查位置是否为障碍物
+        index = map_y * width + map_x
+        if self.map_data.data[index] > 50 or self.map_data.data[index] == -1:
+            return -float('inf')
+            
+        # 计算信息增益
+        info_gain = self.calculate_information_gain(position)
+        
+        # 计算到机器人当前位置的距离（希望不要太远）
+        distance_to_robot = np.linalg.norm(position - self.robot_position)
+        distance_penalty = -0.1 * distance_to_robot
+        
+        # 如果当前有目标点，考虑与目标点的距离
+        target_bonus = 0
+        if self.current_target is not None:
+            distance_to_target = np.linalg.norm(position - self.current_target)
+            if distance_to_target < self.hysteresis_radius:
+                target_bonus = self.hysteresis_gain
+                
+        return info_gain + distance_penalty + target_bonus
+        
+    def update_particles(self):
+        """更新粒子群"""
+        if not self.particles or self.map_data is None:
+            return
+            
+        # 更新全局最优
+        for particle in self.particles:
+            fitness = self.calculate_fitness(particle.position)
+            if fitness > self.global_best_fitness:
+                self.global_best_fitness = fitness
+                self.global_best_position = particle.position.copy()
+                # 更新当前目标
+                self.current_target = self.global_best_position.copy()
+                
+        # 更新各粒子
+        for particle in self.particles:
+            # 标准PSO速度更新公式
+            r1, r2 = random.random(), random.random()
+            particle.velocity = (self.w * particle.velocity + 
+                               self.c1 * r1 * (particle.best_position - particle.position) + 
+                               self.c2 * r2 * (self.global_best_position - particle.position))
+            
+            # 限制最大速度
+            max_velocity = 1.0
+            velocity_norm = np.linalg.norm(particle.velocity)
+            if velocity_norm > max_velocity:
+                particle.velocity = particle.velocity / velocity_norm * max_velocity
+                
+            # 更新位置
+            particle.position += particle.velocity
+            
+            # 计算适应度并更新个体最优
+            fitness = self.calculate_fitness(particle.position)
+            if fitness > particle.best_fitness:
+                particle.best_fitness = fitness
+                particle.best_position = particle.position.copy()
+                
+    def publish_visualization(self):
+        """发布可视化信息"""
+        if self.map_data is None:
+            return
+            
+        # 发布粒子
+        particles_marker = Marker()
+        particles_marker.header.frame_id = self.map_data.header.frame_id
+        particles_marker.header.stamp = rospy.Time.now()
+        particles_marker.ns = "particles"
+        particles_marker.id = 0
+        particles_marker.type = Marker.POINTS
+        particles_marker.action = Marker.ADD
+        particles_marker.pose.orientation.w = 1.0
+        particles_marker.scale.x = 0.1
+        particles_marker.scale.y = 0.1
+        particles_marker.color.a = 1.0
+        particles_marker.color.r = 1.0
+        particles_marker.color.g = 0.5
+        particles_marker.color.b = 0.0
+        
+        for particle in self.particles:
+            point = PointStamped()
+            point.point.x = particle.position[0]
+            point.point.y = particle.position[1]
+            point.point.z = 0.0
+            particles_marker.points.append(point.point)
+            
+        self.particles_pub.publish(particles_marker)
+        
+        # 发布前沿点
+        frontiers_marker = Marker()
+        frontiers_marker.header.frame_id = self.map_data.header.frame_id
+        frontiers_marker.header.stamp = rospy.Time.now()
+        frontiers_marker.ns = "frontiers"
+        frontiers_marker.id = 1
+        frontiers_marker.type = Marker.POINTS
+        frontiers_marker.action = Marker.ADD
+        frontiers_marker.pose.orientation.w = 1.0
+        frontiers_marker.scale.x = 0.2
+        frontiers_marker.scale.y = 0.2
+        frontiers_marker.color.a = 1.0
+        frontiers_marker.color.r = 0.0
+        frontiers_marker.color.g = 1.0
+        frontiers_marker.color.b = 0.0
+        
+        for frontier in self.frontiers:
+            point = PointStamped()
+            point.point.x = frontier[0]
+            point.point.y = frontier[1]
+            point.point.z = 0.0
+            frontiers_marker.points.append(point.point)
+            
+        self.frontiers_pub.publish(frontiers_marker)
+        
+        # 发布当前目标点
+        if self.current_target is not None:
+            target_msg = PointStamped()
+            target_msg.header.frame_id = self.map_data.header.frame_id
+            target_msg.header.stamp = rospy.Time.now()
+            target_msg.point.x = self.current_target[0]
+            target_msg.point.y = self.current_target[1]
+            target_msg.point.z = 0.0
+            self.target_pub.publish(target_msg)
+            
+    def move_to_target(self):
+        """控制机器人移动到目标点"""
+        if self.current_target is None:
+            # 没有目标点，停止机器人
+            cmd_vel = Twist()
+            self.cmd_vel_pub.publish(cmd_vel)
+            return
+            
+        # 检查是否到达目标点
+        distance_to_target = np.linalg.norm(self.current_target - self.robot_position)
+        if distance_to_target < self.goal_tolerance:
+            rospy.loginfo("到达目标点")
+            # 清除目标点，寻找下一个目标
+            self.current_target = None
+            self.last_target_time = rospy.Time.now()
+            cmd_vel = Twist()
+            self.cmd_vel_pub.publish(cmd_vel)
+            return
+            
+        # 检查目标点是否超时
+        if (rospy.Time.now() - self.last_target_time) > self.target_timeout:
+            rospy.loginfo("目标点超时，寻找新目标")
+            self.current_target = None
+            self.last_target_time = rospy.Time.now()
+            cmd_vel = Twist()
+            self.cmd_vel_pub.publish(cmd_vel)
+            return
+            
+        # 计算到目标点的方向
+        delta = self.current_target - self.robot_position
+        target_angle = math.atan2(delta[1], delta[0])
+        angle_diff = self.normalize_angle(target_angle - self.robot_orientation)
+        
+        # 检查路径上是否有障碍物
+        if self.is_obstacle_ahead(self.current_target):
+            rospy.logwarn("路径上有障碍物，停止前进")
+            cmd_vel = Twist()
+            self.cmd_vel_pub.publish(cmd_vel)
+            return
+            
+        # 生成速度命令
+        cmd_vel = Twist()
+        
+        # 如果角度差较大，先旋转
+        if abs(angle_diff) > 0.2:
+            cmd_vel.angular.z = np.clip(angle_diff * 1.0, -self.max_angular_speed, self.max_angular_speed)
+        else:
+            # 角度差不多了，前进
+            cmd_vel.linear.x = np.clip(distance_to_target * 0.5, 0, self.max_linear_speed)
+            # 微调角度
+            cmd_vel.angular.z = np.clip(angle_diff * 0.5, -self.max_angular_speed, self.max_angular_speed)
+            
+        self.cmd_vel_pub.publish(cmd_vel)
+        
+    def run(self):
+        """主循环"""
+        rate = rospy.Rate(10)  # 10 Hz
+        
+        rospy.loginfo("开始自动探索...")
+        
+        while not rospy.is_shutdown():
+            # 更新粒子群
+            self.update_particles()
+            
+            # 控制机器人移动到目标点
+            self.move_to_target()
+            
+            # 发布可视化信息
+            self.publish_visualization()
+            
+            rate.sleep()
+
+if __name__ == '__main__':
+    try:
+        explorer = RPSOExploration()
+        explorer.run()
+    except rospy.ROSInterruptException:
+        pass
+    except Exception as e:
+        rospy.logerr("程序异常: %s", str(e))
